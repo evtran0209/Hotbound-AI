@@ -1,12 +1,14 @@
-import React from 'react';
+import './globals.css';
+import type { Metadata } from 'next';
 import { Inter } from 'next/font/google';
-import { NextAuthProvider } from './providers';
+import { SessionProvider } from 'next-auth/react';
+import Navigation from './components/Navigation';
 
 const inter = Inter({ subsets: ['latin'] });
 
-export const metadata = {
-  title: 'Hotbound AI',
-  description: 'AI-powered sales training platform',
+export const metadata: Metadata = {
+  title: 'HotBound AI - Sales Call Simulation',
+  description: 'Practice your sales calls with AI-powered voice agents',
 };
 
 export default function RootLayout({
@@ -17,7 +19,10 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={inter.className}>
-        <NextAuthProvider>{children}</NextAuthProvider>
+        <SessionProvider>
+          <Navigation />
+          <main>{children}</main>
+        </SessionProvider>
       </body>
     </html>
   );

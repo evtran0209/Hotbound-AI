@@ -1,113 +1,52 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { v4 as uuidv4 } from 'uuid';
-import { OpenAI } from 'openai';
-import { getPersonaById } from '@/app/utils/pineconeClient';
+import { NextResponse } from "next/server";
+import axios from "axios";
 
-// Initialize OpenAI client
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// Store active sessions
-const activeSessions = new Map();
-
-export async function POST(request: NextRequest) {
+export async function POST(req: Request) {
   try {
-    const { personaId, profileData, simulationType, systemPrompt } = await request.json();
+    const { persona } = await req.json();
 
-    // Generate a unique session ID
-    const sessionId = uuidv4();
-
-    let finalSystemPrompt = '';
-
-    if (systemPrompt) {
-      // If a system prompt is provided directly, use it
-      finalSystemPrompt = systemPrompt;
-    } else if (personaId) {
-      // If a persona ID is provided, retrieve the persona from Pinecone
-      const personaRecord = await getPersonaById(personaId);
-      
-      if (!personaRecord) {
-        return NextResponse.json(
-          { error: 'Persona not found' },
-          { status: 404 }
-        );
+    // Initialize Deepgram voice agent
+    const response = await axios.post(
+      "https://api.deepgram.com/v1/projects/43bf26be-a1c3-43b8-bb6a-539ae774cc20/agents",
+      {
+        name: "Sales Prospect Agent",
+        description: "A voice agent simulating a sales prospect",
+        knowledge: persona,
+        capabilities: {
+          realtime_transcription: true,
+          voice_synthesis: true
+        },
+        system_prompt: `You are a sales prospect with the following background and personality: ${persona}. 
+        You should act naturally, raise realistic objections, and ask probing questions about the product. 
+        Be skeptical but professional, and make decisions based on your role and company needs.`,
+        temperature: 0.7,
+        max_tokens: 150
+      },
+      {
+        headers: {
+          "Authorization": `Token ${process.env.DEEPGRAM_API_KEY}`,
+          "Content-Type": "application/json"
+        }
       }
-      
-      // Use the system prompt from the persona record
-      finalSystemPrompt = personaRecord.metadata.systemPrompt || 
-        `You are simulating a buyer persona based on the following information: ${JSON.stringify(personaRecord.metadata)}`;
-    } else if (profileData && simulationType === 'linkedin') {
-      // For LinkedIn profile data, generate a system prompt
-      finalSystemPrompt = await generateLinkedInPersonaPrompt(profileData);
-    } else {
-      return NextResponse.json(
-        { error: 'Invalid request: missing persona information' },
-        { status: 400 }
-      );
-    }
+    );
 
-    // Initialize the conversation with OpenAI
-    const messages = [
-      { role: 'system', content: finalSystemPrompt },
-      { role: 'assistant', content: 'Hello, this is ' + (profileData?.fullName || 'your prospect') + '. How can I help you today?' }
-    ];
-
-    // Store the session
-    activeSessions.set(sessionId, {
-      messages,
-      lastActivity: Date.now(),
-      personaId,
-      profileData,
-    });
+    // Store the agent ID in the session or temporary storage
+    const agentId = response.data.agent_id;
 
     return NextResponse.json({
-      sessionId,
-      initialMessage: messages[1].content,
+      success: true,
+      agentId,
+      wsUrl: response.data.websocket_url // URL for real-time communication
     });
   } catch (error) {
-    console.error('Error starting voice agent:', error);
+    console.error("Error starting voice agent:", error);
     return NextResponse.json(
-      { error: 'Failed to start voice agent' },
+      { 
+        success: false, 
+        error: "Failed to start voice agent",
+        details: error.response?.data || error.message
+      },
       { status: 500 }
     );
-  }
-}
-
-async function generateLinkedInPersonaPrompt(profileData: any) {
-  try {
-    // Generate a system prompt for the LinkedIn profile
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        {
-          role: 'system',
-          content: 'You are an expert at creating realistic buyer personas for sales simulations. Your task is to create a detailed system prompt that will be used to simulate a buyer persona in a sales call scenario.'
-        },
-        {
-          role: 'user',
-          content: `Create a detailed system prompt for a sales call simulation where the AI will act as a buyer persona based on this LinkedIn profile data:
-          
-${JSON.stringify(profileData, null, 2)}
-
-The system prompt should:
-1. Instruct the AI to behave realistically as this specific buyer persona
-2. Include personality traits, communication style, and decision-making factors
-3. Incorporate knowledge about their company, industry challenges, and pain points
-4. Define how they would typically respond to sales pitches
-5. Include specific objections or concerns they might raise
-6. Specify their budget sensitivity and decision-making authority
-
-Format the prompt as a direct instruction to the AI, starting with "You are simulating a buyer persona..."`
-        }
-      ],
-      temperature: 0.7,
-      max_tokens: 1500,
-    });
-
-    return completion.choices[0].message.content || '';
-  } catch (error) {
-    console.error('Error generating LinkedIn persona prompt:', error);
-    throw new Error('Failed to generate persona prompt');
   }
 }

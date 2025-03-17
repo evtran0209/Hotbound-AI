@@ -1,160 +1,218 @@
 "use client";
 
-import { useState, useEffect } from 'react';
-import { useSession } from 'next-auth/react';
-import { useRouter } from 'next/navigation';
-import SimulationInterface from '../components/SimulationInterface';
-import FeedbackDisplay from '../components/FeedbackDisplay';
-import PersonaInputForm from '../components/PersonaInputForm';
-import LinkedInProfileInput from '../components/LinkedInProfileInput';
+import { useEffect, useState, useRef } from "react";
+import { useSession } from "next-auth/react";
+import { useRouter } from "next/navigation";
+import { WebSocketConnection } from "@/utils/websocketHelper";
+import AudioVisualizer from '@/components/AudioVisualizer';
+import TranscriptDisplay from '@/components/TranscriptDisplay';
+import VolumeControl from '@/components/VolumeControl';
+import { WebSocketManager } from '@/utils/WebSocketManager';
+import { SpeechProcessor } from '@/utils/SpeechProcessor';
+import { CallRecorder } from '@/utils/CallRecorder';
+import FeedbackDisplay from '@/components/FeedbackDisplay';
 
-interface PersonaData {
-  personaId: string;
-  personaData: any;
-  systemPrompt: string;
-  metadata: {
-    linkedInUrl?: string;
-    jobTitle?: string;
-    companyName?: string;
-    industry?: string;
-    seniorityLevel?: string;
-    keywords?: string[];
-    createdAt: string;
-  };
+interface Persona {
+  profileData: string;
+  persona: string;
 }
 
-export default function CallSimulationPage() {
+interface Message {
+  speaker: 'user' | 'agent';
+  text: string;
+  timestamp: number;
+}
+
+export default function CallSimulation() {
   const { data: session, status } = useSession();
   const router = useRouter();
-  
-  const [personaData, setPersonaData] = useState<PersonaData | null>(null);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [initialMessage, setInitialMessage] = useState<string | null>(null);
-  const [feedback, setFeedback] = useState<string | null>(null);
+  const [isCallActive, setIsCallActive] = useState(false);
+  const [persona, setPersona] = useState<Persona | null>(null);
+  const [feedback, setFeedback] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [inputMode, setInputMode] = useState<'persona' | 'linkedin' | 'simulation'>('persona');
+  const [error, setError] = useState("");
+  const wsConnectionRef = useRef<WebSocketConnection | null>(null);
+  const [transcript, setTranscript] = useState<string[]>([]);
+  const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [connectionStatus, setConnectionStatus] = useState<'connected' | 'disconnected' | 'reconnecting'>('disconnected');
+  const wsManagerRef = useRef<WebSocketManager | null>(null);
+  const speechProcessorRef = useRef<SpeechProcessor | null>(null);
+  const [showFeedback, setShowFeedback] = useState(false);
+  const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
+  const callRecorderRef = useRef<CallRecorder | null>(null);
 
   useEffect(() => {
-    if (status === 'loading') return;
-    
+    if (status === "loading") return;
     if (!session) {
-      router.push('/auth/signin');
+      router.push("/auth/signin");
       return;
     }
 
-    // Check if we have persona data in session storage
-    const storedPersona = sessionStorage.getItem('currentPersona');
+    const storedPersona = localStorage.getItem("currentPersona");
     if (storedPersona) {
-      try {
-        const parsedData = JSON.parse(storedPersona);
-        setPersonaData(parsedData);
-        setInputMode('simulation');
-        startSimulation(parsedData);
-      } catch (error) {
-        console.error('Error parsing stored persona data:', error);
-      }
+      setPersona(JSON.parse(storedPersona));
+    } else {
+      router.push("/persona-search");
     }
 
-    // Check if we have LinkedIn profile data in session storage
-    const storedLinkedInData = sessionStorage.getItem('linkedinProfileData');
-    if (storedLinkedInData && !storedPersona) {
-      try {
-        const parsedData = JSON.parse(storedLinkedInData);
-        handleLinkedInProfileProcessed(parsedData);
-      } catch (error) {
-        console.error('Error parsing stored LinkedIn data:', error);
+    // Cleanup WebSocket on unmount
+    return () => {
+      if (wsConnectionRef.current) {
+        wsConnectionRef.current.disconnect();
       }
-    }
+    };
   }, [session, status, router]);
 
-  const handlePersonaCreated = (data: PersonaData) => {
-    setPersonaData(data);
-    sessionStorage.setItem('currentPersona', JSON.stringify(data));
-    setInputMode('simulation');
-    startSimulation(data);
-  };
-
-  const handleLinkedInProfileProcessed = (data: any) => {
-    setInputMode('simulation');
-    startSimulation({ profileData: data, simulationType: 'linkedin' });
-  };
-
-  const startSimulation = async (data: any) => {
+  const startCall = async () => {
     setIsLoading(true);
-    setError('');
-    
+    setError("");
     try {
-      // Start the voice agent session
-      const response = await fetch('/api/voice-agent/start', {
-        method: 'POST',
+      const response = await fetch("/api/voice-agent/start", {
+        method: "POST",
         headers: {
-          'Content-Type': 'application/json',
+          "Content-Type": "application/json",
         },
-        body: JSON.stringify(data),
+        body: JSON.stringify({ persona: persona?.persona }),
       });
-      
+
       if (!response.ok) {
-        throw new Error('Failed to start simulation');
+        throw new Error("Failed to start call");
       }
-      
-      const responseData = await response.json();
-      setSessionId(responseData.sessionId);
-      setInitialMessage(responseData.initialMessage);
-      setInputMode('simulation');
+
+      const { wsUrl, agentId } = await response.json();
+      localStorage.setItem("currentAgentId", agentId);
+
+      // Initialize speech processor
+      speechProcessorRef.current = new SpeechProcessor(
+        (text) => {
+          setMessages(prev => [...prev, {
+            speaker: 'user',
+            text,
+            timestamp: Date.now()
+          }]);
+        },
+        (audioData) => {
+          wsManagerRef.current?.send(audioData);
+        }
+      );
+
+      const stream = await speechProcessorRef.current.initialize();
+      setAudioStream(stream);
+
+      // Initialize WebSocket manager
+      wsManagerRef.current = new WebSocketManager(
+        wsUrl,
+        handleWebSocketMessage,
+        setConnectionStatus
+      );
+      await wsManagerRef.current.connect();
+
+      // Initialize call recorder
+      callRecorderRef.current = new CallRecorder();
+      await callRecorderRef.current.startRecording(stream);
+
+      setIsCallActive(true);
     } catch (error) {
-      setError(error instanceof Error ? error.message : 'An error occurred');
-      console.error('Error starting simulation:', error);
+      setError("Failed to start call. Please try again.");
+      console.error("Call start error:", error);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleEndCall = async () => {
-    if (!sessionId) return;
-    
+  const endCall = async () => {
     setIsLoading(true);
-    
     try {
-      // End the voice agent session
-      const response = await fetch('/api/voice-agent/end', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ sessionId }),
-      });
-      
-      if (!response.ok) {
-        throw new Error('Failed to end simulation');
+      // Stop recording and get the recording blob
+      if (callRecorderRef.current) {
+        const recordingBlob = await callRecorderRef.current.stopRecording();
+        const url = URL.createObjectURL(recordingBlob);
+        setRecordingUrl(url);
       }
+
+      const agentId = localStorage.getItem("currentAgentId");
       
+      if (wsConnectionRef.current) {
+        wsConnectionRef.current.disconnect();
+      }
+
+      const response = await fetch("/api/voice-agent/end", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ agentId }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to end call");
+      }
+
+      const { transcript } = await response.json();
+      setIsCallActive(false);
+      
+      // Generate feedback using the transcript
+      await generateFeedback(transcript);
+
+      setShowFeedback(true);
+    } catch (error) {
+      setError("Failed to end call. Please try again.");
+      console.error("Call end error:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateFeedback = async (callTranscript: string) => {
+    try {
+      const response = await fetch("/api/generate-feedback", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ callTranscript }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to generate feedback");
+      }
+
       const data = await response.json();
       setFeedback(data.feedback);
-      
-      // Clear session data
-      setSessionId(null);
     } catch (error) {
-      setError(error instanceof Error ? error.message : 'An error occurred');
-      console.error('Error ending simulation:', error);
-    } finally {
-      setIsLoading(false);
+      setError("Failed to generate feedback. Please try again.");
+      console.error("Feedback generation error:", error);
     }
   };
 
-  const resetSimulation = () => {
-    setPersonaData(null);
-    setSessionId(null);
-    setInitialMessage(null);
-    setFeedback(null);
-    setInputMode('persona');
-    
-    // Clear session storage
-    sessionStorage.removeItem('currentPersona');
-    sessionStorage.removeItem('linkedinProfileData');
+  const handleWebSocketMessage = (event: MessageEvent) => {
+    const response = JSON.parse(event.data);
+    if (response.type === 'transcript') {
+      setMessages(prev => [...prev, {
+        speaker: 'agent',
+        text: response.text,
+        timestamp: Date.now()
+      }]);
+    }
   };
 
-  if (status === 'loading') {
+  useEffect(() => {
+    return () => {
+      speechProcessorRef.current?.stop();
+      wsManagerRef.current?.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (recordingUrl) {
+        URL.revokeObjectURL(recordingUrl);
+      }
+    };
+  }, [recordingUrl]);
+
+  if (status === "loading" || !persona) {
     return (
       <div className="min-h-screen flex justify-center items-center">
         <p>Loading...</p>
@@ -163,133 +221,15 @@ export default function CallSimulationPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 py-8 px-4 sm:px-6 lg:px-8">
-      <div className="max-w-6xl mx-auto">
-        <div className="text-center mb-6">
-          <h1 className="text-3xl font-extrabold text-gray-900">
-            Sales Call Simulation
-          </h1>
-          <p className="mt-2 text-xl text-gray-500">
-            Practice your sales pitch with AI-powered buyer personas
-          </p>
+    <div className="min-h-screen flex flex-col items-center p-8 bg-gray-100">
+      <div className="w-full max-w-4xl bg-white rounded-lg shadow-md p-8">
+        <h1 className="text-2xl font-bold mb-6">Sales Call Simulation</h1>
+        
+        <div className="mb-8 p-6 bg-gray-50 rounded-lg">
+          <h2 className="text-xl font-semibold mb-4">Prospect Profile</h2>
+          <div className="prose max-w-none">
+            <pre className="whitespace-pre-wrap text-sm">{persona.persona}</pre>
+          </div>
         </div>
-        
-        {error && (
-          <div className="mb-6 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-md">
-            {error}
-          </div>
-        )}
-        
-        {inputMode === 'persona' && (
-          <div className="mb-6">
-            <div className="bg-white shadow overflow-hidden sm:rounded-lg p-6">
-              <h2 className="text-xl font-semibold mb-4">Choose Input Method</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div 
-                  className="border border-gray-200 rounded-lg p-4 hover:border-blue-500 cursor-pointer transition-colors"
-                  onClick={() => setInputMode('persona')}
-                >
-                  <h3 className="text-lg font-medium text-gray-900 mb-2">Create Custom Persona</h3>
-                  <p className="text-gray-500">
-                    Build a detailed buyer persona by providing job title, company, industry, and keywords.
-                  </p>
-                </div>
-                <div 
-                  className="border border-gray-200 rounded-lg p-4 hover:border-blue-500 cursor-pointer transition-colors"
-                  onClick={() => setInputMode('linkedin')}
-                >
-                  <h3 className="text-lg font-medium text-gray-900 mb-2">Use LinkedIn Profile</h3>
-                  <p className="text-gray-500">
-                    Generate a persona based on a LinkedIn profile URL.
-                  </p>
-                </div>
-              </div>
-            </div>
-            
-            <div className="mt-6">
-              <PersonaInputForm onPersonaCreated={handlePersonaCreated} />
-            </div>
-          </div>
-        )}
-        
-        {inputMode === 'linkedin' && (
-          <div className="mb-6">
-            <LinkedInProfileInput onProfileProcessed={handleLinkedInProfileProcessed} />
-            <div className="mt-4 text-center">
-              <button
-                onClick={() => setInputMode('persona')}
-                className="text-blue-600 hover:text-blue-800"
-              >
-                ← Back to persona creation
-              </button>
-            </div>
-          </div>
-        )}
-        
-        {inputMode === 'simulation' && sessionId && (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Persona Information */}
-            <div className="bg-white shadow overflow-hidden sm:rounded-lg">
-              <div className="px-4 py-5 sm:px-6">
-                <h2 className="text-lg font-medium text-gray-900">Buyer Persona</h2>
-              </div>
-              <div className="border-t border-gray-200 px-4 py-5 sm:p-0">
-                {personaData && (
-                  <dl className="sm:divide-y sm:divide-gray-200">
-                    <div className="py-3 sm:py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6">
-                      <dt className="text-sm font-medium text-gray-500">Name/Role</dt>
-                      <dd className="mt-1 text-sm text-gray-900 sm:mt-0 sm:col-span-2">
-                        {personaData.metadata?.jobTitle || 'Buyer Persona'}
-                      </dd>
-                    </div>
-                    <div className="py-3 sm:py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6">
-                      <dt className="text-sm font-medium text-gray-500">Company</dt>
-                      <dd className="mt-1 text-sm text-gray-900 sm:mt-0 sm:col-span-2">
-                        {personaData.metadata?.companyName || 'N/A'}
-                      </dd>
-                    </div>
-                    <div className="py-3 sm:py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6">
-                      <dt className="text-sm font-medium text-gray-500">Industry</dt>
-                      <dd className="mt-1 text-sm text-gray-900 sm:mt-0 sm:col-span-2">
-                        {personaData.metadata?.industry || 'N/A'}
-                      </dd>
-                    </div>
-                    <div className="py-3 sm:py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6">
-                      <dt className="text-sm font-medium text-gray-500">Focus Areas</dt>
-                      <dd className="mt-1 text-sm text-gray-900 sm:mt-0 sm:col-span-2">
-                        {personaData.metadata?.keywords?.join(', ') || 'N/A'}
-                      </dd>
-                    </div>
-                  </dl>
-                )}
-              </div>
-            </div>
-            
-            {/* Simulation Interface */}
-            <div className="lg:col-span-2">
-              <SimulationInterface
-                sessionId={sessionId}
-                initialMessage={initialMessage || undefined}
-                onEndCall={handleEndCall}
-              />
-              
-              {feedback && (
-                <div className="mt-6">
-                  <FeedbackDisplay feedback={feedback} />
-                  <div className="mt-4 text-center">
-                    <button
-                      onClick={resetSimulation}
-                      className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-                    >
-                      Start New Simulation
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
+
+        <div className="flex flex-col items-
